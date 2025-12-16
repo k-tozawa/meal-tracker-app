@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MealLogger</string>
+    <string name="take_photo">写真を撮る</string>
+    <string name="suggest_meal">献立を提案</string>
+    <string name="show_advice">アドバイスを表示</string>
+    <string name="analyzing">解析中...</string>
+    <string name="listening">音声を聞いています...</string>
+    <string name="permission_required">権限が必要です</string>
+</resources>

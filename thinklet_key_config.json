@@ -1,0 +1,50 @@
+{
+  "version": 2,
+  "actions": [
+    {
+      "key": "CENTER",
+      "event": "SINGLE_RELEASED",
+      "action": {
+        "type": "LAUNCH_APP",
+        "intent": {
+          "component": {
+            "package": "com.example.meallogger",
+            "class": ".LoginActivity"
+          },
+          "flags": [
+            "FLAG_ACTIVITY_NEW_TASK",
+            "FLAG_ACTIVITY_RESET_TASK_IF_NEEDED"
+          ]
+        }
+      }
+    },
+    {
+      "key": "LEFT",
+      "event": "SINGLE_RELEASED",
+      "action": {
+        "type": "LAUNCH_APP",
+        "intent": {
+          "action": "com.example.meallogger.ACTION_SUGGEST",
+          "flags": [
+            "FLAG_ACTIVITY_NEW_TASK",
+            "FLAG_ACTIVITY_RESET_TASK_IF_NEEDED"
+          ]
+        }
+      }
+    },
+    {
+      "key": "RIGHT",
+      "event": "SINGLE_RELEASED",
+      "action": {
+        "type": "LAUNCH_APP",
+        "intent": {
+          "action": "com.example.meallogger.ACTION_ANALYZE",
+          "flags": [
+            "FLAG_ACTIVITY_NEW_TASK",
+            "FLAG_ACTIVITY_RESET_TASK_IF_NEEDED"
+          ]
+        }
+      }
+    }
+  ]
+}
