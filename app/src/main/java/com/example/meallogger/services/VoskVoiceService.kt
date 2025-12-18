@@ -74,6 +74,12 @@ class VoskVoiceService(private val context: Context) {
         ) {
             Log.d(TAG, "VAD Callback - SpeechState: $aSpeechState, buffer size: ${aBuffer.size}")
 
+            // 録音中でなければVADコールバックを無視（TTS再生中など）
+            if (!isRecording.get()) {
+                Log.d(TAG, "VAD callback ignored (not recording)")
+                return
+            }
+
             when (aSpeechState) {
                 TLXFEData.SpeechState.SpeechStart -> {
                     Log.d(TAG, "Speech detected - Starting Vosk recognition")
@@ -249,8 +255,44 @@ class VoskVoiceService(private val context: Context) {
                 return@launch
             }
 
+            // XFE処理を開始（ここで1回だけ開始し、以降は動かしっぱなし）
+            val ret = xfe?.startProcessing()
+            if (ret == null || ret < 0) {
+                Log.e(TAG, "Failed to start XFE processing during initialization: $ret")
+                mainHandler.post { onComplete?.invoke(false) }
+                return@launch
+            }
+            Log.d(TAG, "XFE processing started and will stay active")
+
+            // AudioRecordを作成（ここで1回だけ作成、以降は停止・再開のみ）
+            if (!createAudioRecord()) {
+                Log.e(TAG, "Failed to create AudioRecord")
+                mainHandler.post { onComplete?.invoke(false) }
+                return@launch
+            }
+
+            // AudioRecordを開始（常に動かし続ける）
+            try {
+                audioRecorder?.startRecording()
+                Log.d(TAG, "AudioRecord started (will stay active)")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start AudioRecord", e)
+                mainHandler.post { onComplete?.invoke(false) }
+                return@launch
+            }
+
+            // エコーキャンセル用の無音再生を開始（常に動かし続ける）
+            emptyAudioPlayer.start()
+            Log.d(TAG, "EmptyAudioPlayer started for continuous AEC")
+
+            // 録音ループを開始（常に動かし続ける）
+            recordingJob = CoroutineScope(Dispatchers.IO).launch {
+                recordAudioLoop(audioRecordBufferSize)
+            }
+            Log.d(TAG, "Recording loop started (will stay active)")
+
             isInitialized.set(true)
-            Log.d(TAG, "XFE and Vosk initialized successfully")
+            Log.d(TAG, "XFE, Vosk, AudioRecord, and AEC initialized and running continuously")
             mainHandler.post { onComplete?.invoke(true) }
         }
     }
@@ -271,20 +313,10 @@ class VoskVoiceService(private val context: Context) {
         this.onResultCallback = onResult
         this.onErrorCallback = onError
 
-        // XFE startProcessing → AudioRecord作成 → 録音開始
-        CoroutineScope(Dispatchers.IO).launch {
-            // XFE処理を開始（setupは起動時に1回だけ済んでいる）
-            val ret = xfe?.startProcessing()
-            if (ret == null || ret < 0) {
-                Log.e(TAG, "Failed to start XFE processing: $ret")
-                mainHandler.post { onError?.invoke("XFE処理の開始に失敗しました") }
-                return@launch
-            }
-            Log.d(TAG, "XFE processing started")
-
-            // AudioRecordを作成して録音開始
-            startRecording()
-        }
+        // AudioRecord/XFE/AECはすでに動作中なので、フラグをONにするだけ
+        isRecording.set(true)
+        isSpeechActive = false
+        Log.d(TAG, "Voice recognition enabled (AudioRecord/XFE/AEC already running)")
     }
 
     private fun setupAudioManager() {
@@ -395,13 +427,13 @@ class VoskVoiceService(private val context: Context) {
                 .build()
         )
 
-        // VAD設定（サンプルベース、TimeToInactiveのみ1.5秒）
+        // VAD設定（サンプルと同じ）
         xfe?.setVadConfig(
             TLXFEConfigs.Vad.Builder()
                 .setTimeToActive(100)      // 100ms音声検出で開始
                 .setTimeToInactive(1500)   // 1500ms（1.5秒）無音で終了
                 .setHeadPaddingTime(400)   // 前方400msパディング
-                .setTailPaddingTime(400)   // 後方400msパディング（サンプルと同じ）
+                .setTailPaddingTime(400)   // 後方400msパディング
                 .setDbfsThreshold(-60)     // -60dBFS閾値
                 .build()
         )
@@ -456,9 +488,9 @@ class VoskVoiceService(private val context: Context) {
     }
 
     @android.annotation.SuppressLint("MissingPermission")
-    private fun startRecording() {
+    private fun createAudioRecord(): Boolean {
         try {
-            // AudioRecordを作成
+            // AudioRecordを作成（1回だけ）
             val sampleRate = 48000
             audioRecordBufferSize = AudioRecord.getMinBufferSize(
                 sampleRate,
@@ -478,6 +510,18 @@ class VoskVoiceService(private val context: Context) {
                 .setBufferSizeInBytes(audioRecordBufferSize)
                 .build()
 
+            Log.d(TAG, "Created AudioRecord (6-channel 48kHz)")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create AudioRecord", e)
+            return false
+        }
+    }
+
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun startRecording() {
+        try {
+            // AudioRecordを再開（すでに作成済み）
             audioRecorder?.startRecording()
             isRecording.set(true)
             isSpeechActive = false
@@ -505,21 +549,23 @@ class VoskVoiceService(private val context: Context) {
         var readCountInByte: Int
         var dataCount = 0
 
-        while (isRecording.get()) {
+        // AudioRecordとXFEを常に動かし続ける（停止条件はshutdown時のみ）
+        while (isInitialized.get()) {
             try {
+                // AudioRecordから常にデータを読み取る（バッファをクリアし続ける）
                 readCountInByte = audioRecorder?.read(pcmBuffer, 0, pcmBuffer.size) ?: -1
 
                 if (readCountInByte > 0) {
                     dataCount++
-                    if (dataCount % 100 == 0) {
+                    if (dataCount % 100 == 0 && isRecording.get()) {
                         Log.d(TAG, "Received PCM data: $readCountInByte bytes (count: $dataCount)")
                     }
 
-                    // XFEにPCMデータを送る（サンプルコードと同じく常にreadCountサイズでコピー）
+                    // XFEには常にデータを送る（VADを常に動作させる）
                     val ret = xfe?.enqueue(pcmBuffer.copyOf(readCountInByte))
                     if (ret != null && ret < 0) {
                         Log.e(TAG, "XFE enqueue failed: $ret")
-                    } else if (dataCount % 100 == 0) {
+                    } else if (dataCount % 100 == 0 && isRecording.get()) {
                         Log.d(TAG, "XFE enqueue success: $ret")
                     }
                 } else if (readCountInByte < 0) {
@@ -536,33 +582,18 @@ class VoskVoiceService(private val context: Context) {
     }
 
     fun stopRecording() {
-        Log.d(TAG, "Stopping recording and XFE processing")
+        Log.d(TAG, "Stopping voice recognition (AudioRecord, XFE, AEC stay active)")
 
-        // 録音を停止
+        // 音声認識フラグを停止（AudioRecord/XFE/AECは動き続ける）
         isRecording.set(false)
         isSpeechActive = false
 
-        // 録音ジョブの終了を待つ
-        recordingJob?.cancel()
-        recordingJob = null
+        // コールバックをクリア
+        onResultCallback = null
+        onErrorCallback = null
 
-        // AudioRecordを停止・解放
-        try {
-            audioRecorder?.stop()
-            audioRecorder?.release()
-            audioRecorder = null
-            Log.d(TAG, "AudioRecord stopped and released")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping AudioRecord", e)
-        }
-
-        // エコーキャンセル用の無音再生を停止
-        emptyAudioPlayer.stop()
-        Log.d(TAG, "Stopped EmptyAudioPlayer")
-
-        // XFE処理を停止（cleanup()はshutdown時のみ）
-        val ret = xfe?.stopProcessing()
-        Log.d(TAG, "XFE processing stopped: $ret")
+        // AudioRecord/XFE/AECは停止しない（常に動作させる）
+        Log.d(TAG, "AudioRecord, XFE, and AEC continue running")
 
         // デバッグ用ファイルを閉じる
         if (enableDebugRecording && debugOutputStream != null) {
@@ -592,7 +623,9 @@ class VoskVoiceService(private val context: Context) {
             Log.e(TAG, "Error releasing AudioRecord", e)
         }
 
-        // XFEクリーンアップ
+        // XFE処理を停止してからクリーンアップ
+        val ret = xfe?.stopProcessing()
+        Log.d(TAG, "XFE processing stopped for shutdown: $ret")
         xfe?.cleanup()
         xfe = null
 
