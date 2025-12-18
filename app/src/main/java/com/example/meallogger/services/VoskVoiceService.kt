@@ -6,6 +6,7 @@ import ai.fd.thinklet.xfe.TLXFEData
 import ai.fd.thinklet.xfe.TLXFEPreprocessor
 import android.content.Context
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Handler
@@ -26,6 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class VoskVoiceService(private val context: Context) {
 
     private var audioRecorder: AudioRecord? = null
+    private var audioManager: AudioManager? = null
     private var xfe: TLXFEPreprocessor? = null
     private var model: Model? = null
     private var recognizer: Recognizer? = null
@@ -37,10 +39,27 @@ class VoskVoiceService(private val context: Context) {
     private var onResultCallback: ((String) -> Unit)? = null
     private var onErrorCallback: ((String) -> Unit)? = null
 
+    // THINKLET audio parameters
+    private var savedInputGain: String? = null
+    private var savedPeakControlGain: String? = null
+
+    // 初期化済みフラグ
+    private var isInitialized = AtomicBoolean(false)
+    private var audioRecordBufferSize: Int = 0
+
     // デバッグ用：VADから出力された音声をファイルに保存
     private var debugOutputStream: FileOutputStream? = null
     private var debugFilePath: String? = null
     private val enableDebugRecording = true // デバッグモード
+
+    // Stream callback - 連続音声ストリーム（不要かもしれない）
+    /*
+    private val streamCallback = object : TLXFECallback.StreamCallback {
+        override fun onData(aBuffer: ByteArray, aUserData: Any?) {
+            Log.d(TAG, "Stream callback: ${aBuffer.size} bytes")
+        }
+    }
+    */
 
     // VAD callback - 音声の開始/終了を検出してVoskで認識
     private val vadCallback = object : TLXFECallback.VadCallback {
@@ -203,11 +222,35 @@ class VoskVoiceService(private val context: Context) {
         }
     }
 
-    // アプリ起動時にバックグラウンドでモデルをロード
+    // アプリ起動時にバックグラウンドで全て初期化
     fun initializeModel(onComplete: ((Boolean) -> Unit)? = null) {
         CoroutineScope(Dispatchers.IO).launch {
-            val success = loadVoskModel()
-            mainHandler.post { onComplete?.invoke(success) }
+            val voskLoaded = loadVoskModel()
+            if (!voskLoaded) {
+                mainHandler.post { onComplete?.invoke(false) }
+                return@launch
+            }
+
+            // AudioManager設定
+            setupAudioManager()
+
+            // XFE初期化
+            val xfeReady = setupXfe()
+            if (!xfeReady) {
+                mainHandler.post { onComplete?.invoke(false) }
+                return@launch
+            }
+
+            // AudioRecord作成（まだ録音開始しない）
+            val audioReady = createAudioRecorder()
+            if (!audioReady) {
+                mainHandler.post { onComplete?.invoke(false) }
+                return@launch
+            }
+
+            isInitialized.set(true)
+            Log.d(TAG, "All components initialized successfully")
+            mainHandler.post { onComplete?.invoke(true) }
         }
     }
 
@@ -217,23 +260,17 @@ class VoskVoiceService(private val context: Context) {
             return
         }
 
+        // 初期化済みかチェック
+        if (!isInitialized.get()) {
+            Log.e(TAG, "Not initialized. Call initializeModel() first.")
+            mainHandler.post { onError?.invoke("初期化されていません") }
+            return
+        }
+
         this.onResultCallback = onResult
         this.onErrorCallback = onError
 
-        // モデルがロード済みかチェック
-        if (model == null || recognizer == null) {
-            Log.e(TAG, "Vosk model not loaded. Call initializeModel() first.")
-            mainHandler.post { onError?.invoke("Voskモデルが初期化されていません") }
-            return
-        }
-
-        // XFEの初期化
-        if (!setupXfe()) {
-            mainHandler.post { onError?.invoke("XFE VADの初期化に失敗しました") }
-            return
-        }
-
-        // XFE処理を開始
+        // XFE処理を開始（setupXfeで既にコールバック登録済み）
         val ret = xfe?.startProcessing()
         Log.d(TAG, "XFE startProcessing() returned: $ret")
         if (ret == null || ret < 0) {
@@ -243,8 +280,42 @@ class VoskVoiceService(private val context: Context) {
         }
         Log.d(TAG, "XFE processing started successfully")
 
-        // THINKLET 6ch 48kHz録音開始
+        // 録音開始
         startRecording()
+    }
+
+    private fun setupAudioManager() {
+        try {
+            audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+            // 現在の設定を保存
+            savedInputGain = audioManager?.getParameters("FDEXT_MIC_GAIN")
+            savedPeakControlGain = audioManager?.getParameters("FDEXT_PEAK_CTL_GAIN")
+
+            Log.d(TAG, "Current audio params: input=$savedInputGain, peak=$savedPeakControlGain")
+
+            // THINKLET推奨値を設定
+            audioManager?.setParameters("FDEXT_MIC_GAIN=12")
+            audioManager?.setParameters("FDEXT_PEAK_CTL_GAIN=84")
+
+            Log.d(TAG, "Set THINKLET audio parameters: MIC_GAIN=12, PEAK_CTL_GAIN=84")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to set audio parameters", e)
+        }
+    }
+
+    private fun restoreAudioManager() {
+        try {
+            if (savedInputGain != null) {
+                audioManager?.setParameters(savedInputGain)
+            }
+            if (savedPeakControlGain != null) {
+                audioManager?.setParameters(savedPeakControlGain)
+            }
+            Log.d(TAG, "Restored audio parameters")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore audio parameters", e)
+        }
     }
 
     private fun loadVoskModel(): Boolean {
@@ -292,9 +363,11 @@ class VoskVoiceService(private val context: Context) {
     private fun setupXfe(): Boolean {
         Log.d(TAG, "Setting up XFE")
 
-        // 既存のXFEをクリーンアップ
-        xfe?.cleanup()
-        xfe = null
+        // 既にXFEが存在する場合はスキップ
+        if (xfe != null) {
+            Log.d(TAG, "XFE already set up")
+            return true
+        }
 
         // ライセンスデータの読み込み
         val licenseData = getLicenseData()
@@ -307,6 +380,8 @@ class VoskVoiceService(private val context: Context) {
         xfe = TLXFEPreprocessor(TLXFEPreprocessor.ProcessMode.HumanVoice)
         xfe?.registerLicenseData(licenseData)
         xfe?.registerVadCallback(vadCallback, null)
+        // StreamCallback登録をコメントアウト - VADCallbackだけで動作するか確認
+        // xfe?.registerStreamCallback(streamCallback, null)
 
         // ソース設定（48kHz入力 → 16kHz出力）
         xfe?.setSourceConfig(
@@ -317,13 +392,13 @@ class VoskVoiceService(private val context: Context) {
                 .build()
         )
 
-        // VAD設定
+        // VAD設定（サンプルベース、TimeToInactiveのみ1.5秒）
         xfe?.setVadConfig(
             TLXFEConfigs.Vad.Builder()
                 .setTimeToActive(100)      // 100ms音声検出で開始
-                .setTimeToInactive(600)    // 600ms無音で終了
+                .setTimeToInactive(1500)   // 1500ms（1.5秒）無音で終了
                 .setHeadPaddingTime(400)   // 前方400msパディング
-                .setTailPaddingTime(400)   // 後方400msパディング
+                .setTailPaddingTime(400)   // 後方400msパディング（サンプルと同じ）
                 .setDbfsThreshold(-60)     // -60dBFS閾値
                 .build()
         )
@@ -341,6 +416,35 @@ class VoskVoiceService(private val context: Context) {
 
         Log.d(TAG, "XFE setup complete")
         return true
+    }
+
+    private fun createAudioRecorder(): Boolean {
+        try {
+            val sampleRate = 48000
+            audioRecordBufferSize = AudioRecord.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_OUT_5POINT1,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+
+            audioRecorder = AudioRecord.Builder()
+                .setAudioSource(MediaRecorder.AudioSource.MIC)
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_5POINT1)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .build()
+                )
+                .setBufferSizeInBytes(audioRecordBufferSize)
+                .build()
+
+            Log.d(TAG, "AudioRecord created successfully (buffer: $audioRecordBufferSize bytes)")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create AudioRecord", e)
+            return false
+        }
     }
 
     private fun getLicenseData(): String {
@@ -379,31 +483,18 @@ class VoskVoiceService(private val context: Context) {
 
     @android.annotation.SuppressLint("MissingPermission")
     private fun startRecording() {
+        if (audioRecorder == null) {
+            Log.e(TAG, "AudioRecord not created")
+            mainHandler.post { onErrorCallback?.invoke("AudioRecordが初期化されていません") }
+            return
+        }
+
         try {
-            val sampleRate = 48000
-            val audioRecordBufferSize = AudioRecord.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_OUT_5POINT1,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-
-            audioRecorder = AudioRecord.Builder()
-                .setAudioSource(MediaRecorder.AudioSource.MIC)
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_5POINT1)
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .build()
-                )
-                .setBufferSizeInBytes(audioRecordBufferSize)
-                .build()
-
             audioRecorder?.startRecording()
             isRecording.set(true)
             isSpeechActive = false
 
-            Log.d(TAG, "Started THINKLET 6-channel 48kHz recording with XFE VAD + Vosk (buffer: $audioRecordBufferSize bytes)")
+            Log.d(TAG, "Started THINKLET 6-channel 48kHz recording with XFE VAD + Vosk")
 
             // 録音ループを別スレッドで開始
             recordingJob = CoroutineScope(Dispatchers.IO).launch {
@@ -432,14 +523,8 @@ class VoskVoiceService(private val context: Context) {
                         Log.d(TAG, "Received PCM data: $readCountInByte bytes (count: $dataCount)")
                     }
 
-                    // XFEにPCMデータを送る（読み取ったサイズ分のみ）
-                    val dataToEnqueue = if (readCountInByte < pcmBuffer.size) {
-                        pcmBuffer.copyOf(readCountInByte)
-                    } else {
-                        pcmBuffer
-                    }
-
-                    val ret = xfe?.enqueue(dataToEnqueue)
+                    // XFEにPCMデータを送る（サンプルコードと同じく常にreadCountサイズでコピー）
+                    val ret = xfe?.enqueue(pcmBuffer.copyOf(readCountInByte))
                     if (ret != null && ret < 0) {
                         Log.e(TAG, "XFE enqueue failed: $ret")
                     } else if (dataCount % 100 == 0) {
@@ -473,10 +558,8 @@ class VoskVoiceService(private val context: Context) {
             // XFE処理停止
             xfe?.stopProcessing()
 
-            // 録音停止
+            // 録音停止（releaseしない）
             audioRecorder?.stop()
-            audioRecorder?.release()
-            audioRecorder = null
 
             // デバッグ用ファイルを閉じる
             if (enableDebugRecording && debugOutputStream != null) {
@@ -489,6 +572,18 @@ class VoskVoiceService(private val context: Context) {
                     debugOutputStream = null
                 }
             }
+
+            // XFEを完全リセット（サンプルコードのパターン）
+            Log.d(TAG, "Cleaning up XFE for reset")
+            xfe?.cleanup()
+            xfe = null
+
+            // 次回のstartListening用に再セットアップ
+            if (!setupXfe()) {
+                Log.e(TAG, "Failed to re-setup XFE after recording stop")
+            } else {
+                Log.d(TAG, "XFE re-setup successful")
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping recording", e)
         }
@@ -496,6 +591,15 @@ class VoskVoiceService(private val context: Context) {
 
     fun shutdown() {
         stopRecording()
+
+        // AudioRecord解放
+        try {
+            audioRecorder?.release()
+            audioRecorder = null
+            Log.d(TAG, "AudioRecord released")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error releasing AudioRecord", e)
+        }
 
         // XFEクリーンアップ
         xfe?.cleanup()
@@ -506,6 +610,13 @@ class VoskVoiceService(private val context: Context) {
         recognizer = null
         model?.close()
         model = null
+
+        // AudioManager設定を復元
+        restoreAudioManager()
+        audioManager = null
+
+        isInitialized.set(false)
+        Log.d(TAG, "Shutdown complete")
     }
 
     companion object {

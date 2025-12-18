@@ -34,6 +34,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var userPreferences: UserPreferences
     private var userId: String = ""
 
+    // Physical button confirmation state
+    private var pendingAnalyzeResult: com.example.meallogger.data.AnalyzeResponse? = null
+    private var pendingCorrectionText: String? = null
+    private enum class ConfirmationMode { NONE, ANALYZE_RESULT, CORRECTION }
+    private var confirmationMode = ConfirmationMode.NONE
+
+    // Center button long press detection
+    private var centerButtonDownTime: Long = 0
+    private val LONG_PRESS_THRESHOLD = 500L // 500ms
+
     private val requiredPermissions = arrayOf(
         Manifest.permission.CAMERA,
         Manifest.permission.RECORD_AUDIO,
@@ -291,21 +301,11 @@ class MainActivity : AppCompatActivity() {
                     val itemsText = result.items.joinToString("、") { it.name }
                     binding.statusText.text = itemsText
 
-                    // Speak and then start listening after speech completes
-                    android.util.Log.d("MainActivity", "Speaking result and will start WebSocket listening")
+                    // Speak and then show Yes/No buttons
+                    android.util.Log.d("MainActivity", "Speaking result and will show Yes/No buttons")
                     voiceService.speakAndThen("解析結果: ${itemsText}。この内容で正しいですか?") {
-                        android.util.Log.d("MainActivity", "Starting WebSocket voice recognition for confirmation")
-                        voskVoiceService.startListening(
-                            onResult = { recognizedText ->
-                                android.util.Log.d("MainActivity", "WebSocket voice recognition returned: $recognizedText")
-                                handleUserCorrection(recognizedText, result)
-                            },
-                            onError = { error ->
-                                android.util.Log.e("MainActivity", "WebSocket voice recognition error: $error")
-                                speak("音声認識でエラーが発生しました")
-                                binding.statusText.text = ""
-                            }
-                        )
+                        android.util.Log.d("MainActivity", "Showing Yes/No buttons")
+                        showConfirmButtons(result)
                     }
                 } else {
                     speak("解析に失敗しました。もう一度お試しください。")
@@ -318,17 +318,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun handleUserCorrection(userInput: String, analyzeResult: com.example.meallogger.data.AnalyzeResponse) {
-        lifecycleScope.launch {
-            android.util.Log.d("MainActivity", "handleUserCorrection called with input: $userInput")
+    private fun showConfirmButtons(analyzeResult: com.example.meallogger.data.AnalyzeResponse) {
+        pendingAnalyzeResult = analyzeResult
+        confirmationMode = ConfirmationMode.ANALYZE_RESULT
+        android.util.Log.d(TAG, "Waiting for physical button input (left=Yes, right=No)")
+    }
 
-            if (userInput.contains("はい") || userInput.contains("正しい") ||
-                userInput.contains("ハイ") || userInput.contains("OK") ||
-                userInput.contains("オーケー") || userInput.contains("大丈夫")) {
-                android.util.Log.d("MainActivity", "User confirmed")
-
-                // Save the meal record with all data from analyze result
-                android.util.Log.d("MainActivity", "Saving meal record with description: ${analyzeResult.description}")
+    private fun handleUserConfirmation(confirmed: Boolean, analyzeResult: com.example.meallogger.data.AnalyzeResponse) {
+        if (confirmed) {
+            android.util.Log.d("MainActivity", "User confirmed")
+            lifecycleScope.launch {
                 val saved = mealAnalysisService.saveMealRecord(
                     userId = userId,
                     description = analyzeResult.description,
@@ -339,16 +338,12 @@ class MainActivity : AppCompatActivity() {
 
                 if (saved) {
                     android.util.Log.d("MainActivity", "Save successful")
-
-                    // Build detailed message about the meal
                     val messageBuilder = StringBuilder("食事を記録しました。")
 
-                    // Add description if available
                     if (!analyzeResult.description.isNullOrEmpty()) {
                         messageBuilder.append("内容は、${analyzeResult.description}です。")
                     }
 
-                    // Add nutrition info if available
                     analyzeResult.nutrition?.let { nutrition ->
                         messageBuilder.append("栄養情報は、")
                         val nutritionParts = mutableListOf<String>()
@@ -362,7 +357,6 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
 
-                    // Add advice if available
                     if (!analyzeResult.advice.isNullOrEmpty()) {
                         messageBuilder.append(analyzeResult.advice)
                     }
@@ -372,19 +366,11 @@ class MainActivity : AppCompatActivity() {
                     android.util.Log.d("MainActivity", "Save failed")
                     speak("記録に失敗しました")
                 }
-            } else if (userInput.contains("いいえ") || userInput.contains("違う")) {
-                android.util.Log.d("MainActivity", "User wants to correct")
-                askForCorrection(analyzeResult)
-                return@launch
-            } else if (userInput.contains("キャンセル")) {
-                android.util.Log.d("MainActivity", "User cancelled")
-                speak("記録をキャンセルしました")
-            } else {
-                android.util.Log.d("MainActivity", "Unrecognized input, cancelling")
-                speak("認識できませんでした。記録をキャンセルしました")
+                binding.statusText.text = ""
             }
-
-            binding.statusText.text = ""
+        } else {
+            android.util.Log.d("MainActivity", "User wants to correct")
+            askForCorrection(analyzeResult)
         }
     }
 
@@ -412,54 +398,45 @@ class MainActivity : AppCompatActivity() {
         // Ensure previous recording is stopped
         voskVoiceService.stopRecording()
 
+        binding.statusText.text = correctionText
+
         voiceService.speakAndThen("修正内容は、${correctionText}です。この内容でよろしいですか？") {
-            android.util.Log.d("MainActivity", "Starting WebSocket voice recognition for correction confirmation")
-            voskVoiceService.startListening(
-                onResult = { confirmText ->
-                    android.util.Log.d("MainActivity", "Confirmation result: $confirmText")
+            android.util.Log.d("MainActivity", "Showing Yes/No buttons for correction confirmation")
+            showCorrectionConfirmButtons(correctionText, analyzeResult)
+        }
+    }
 
-                    if (confirmText.contains("はい") || confirmText.contains("正しい") ||
-                        confirmText.contains("ハイ") || confirmText.contains("OK") ||
-                        confirmText.contains("オーケー") || confirmText.contains("大丈夫")) {
-                            // Save with corrected description
-                            lifecycleScope.launch {
-                                val saved = mealAnalysisService.saveMealRecord(
-                                    userId = userId,
-                                    description = correctionText,
-                                    items = analyzeResult.items,
-                                    nutrition = analyzeResult.nutrition,
-                                    advice = analyzeResult.advice
-                                )
+    private fun showCorrectionConfirmButtons(correctionText: String, analyzeResult: com.example.meallogger.data.AnalyzeResponse) {
+        pendingCorrectionText = correctionText
+        pendingAnalyzeResult = analyzeResult
+        confirmationMode = ConfirmationMode.CORRECTION
+        android.util.Log.d(TAG, "Waiting for physical button input for correction (left=Yes, right=No)")
+    }
 
-                                if (saved) {
-                                    android.util.Log.d("MainActivity", "Save successful with correction")
-                                    speak("修正内容で食事を記録しました")
-                                } else {
-                                    android.util.Log.d("MainActivity", "Save failed")
-                                    speak("記録に失敗しました")
-                                }
-                                binding.statusText.text = ""
-                            }
-                        } else if (confirmText.contains("いいえ") || confirmText.contains("違う")) {
-                            // Ask for correction again
-                            android.util.Log.d("MainActivity", "User wants to correct again")
-                            askForCorrection(analyzeResult)
-                        } else if (confirmText.contains("キャンセル")) {
-                            android.util.Log.d("MainActivity", "User cancelled correction")
-                            speak("記録をキャンセルしました")
-                            binding.statusText.text = ""
-                    } else {
-                        android.util.Log.d("MainActivity", "Unrecognized confirmation, asking again")
-                        speak("認識できませんでした。もう一度お願いします")
-                        confirmCorrection(correctionText, analyzeResult)
-                    }
-                },
-                onError = { error ->
-                    android.util.Log.e("MainActivity", "WebSocket voice recognition error: $error")
-                    speak("音声認識でエラーが発生しました")
-                    binding.statusText.text = ""
+    private fun handleCorrectionConfirmation(confirmed: Boolean, correctionText: String, analyzeResult: com.example.meallogger.data.AnalyzeResponse) {
+        if (confirmed) {
+            android.util.Log.d("MainActivity", "User confirmed correction")
+            lifecycleScope.launch {
+                val saved = mealAnalysisService.saveMealRecord(
+                    userId = userId,
+                    description = correctionText,
+                    items = analyzeResult.items,
+                    nutrition = analyzeResult.nutrition,
+                    advice = analyzeResult.advice
+                )
+
+                if (saved) {
+                    android.util.Log.d("MainActivity", "Save successful with correction")
+                    speak("修正内容で食事を記録しました")
+                } else {
+                    android.util.Log.d("MainActivity", "Save failed")
+                    speak("記録に失敗しました")
                 }
-            )
+                binding.statusText.text = ""
+            }
+        } else {
+            android.util.Log.d("MainActivity", "User wants to correct again")
+            askForCorrection(analyzeResult)
         }
     }
 
@@ -542,6 +519,111 @@ class MainActivity : AppCompatActivity() {
             cameraService.setDefaultTargetRotation(savedRotation)
             cameraService.startCamera(binding.previewView, this)
         }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
+        android.util.Log.d(TAG, "onKeyDown: keyCode=$keyCode, confirmationMode=$confirmationMode")
+
+        // Center button press for photo/suggest
+        if (keyCode == android.view.KeyEvent.KEYCODE_CAMERA || // THINKLET center button
+            keyCode == android.view.KeyEvent.KEYCODE_DPAD_CENTER ||
+            keyCode == android.view.KeyEvent.KEYCODE_ENTER) {
+            if (confirmationMode == ConfirmationMode.NONE) {
+                centerButtonDownTime = System.currentTimeMillis()
+                android.util.Log.d(TAG, "Center button down at $centerButtonDownTime")
+                return true
+            }
+        }
+
+        when (confirmationMode) {
+            ConfirmationMode.ANALYZE_RESULT -> {
+                when (keyCode) {
+                    android.view.KeyEvent.KEYCODE_DPAD_LEFT, // THINKLETの左ボタン
+                    android.view.KeyEvent.KEYCODE_VOLUME_UP -> { // フォールバック
+                        android.util.Log.d(TAG, "Yes button (left) pressed")
+                        pendingAnalyzeResult?.let {
+                            confirmationMode = ConfirmationMode.NONE
+                            handleUserConfirmation(true, it)
+                            pendingAnalyzeResult = null
+                        }
+                        return true
+                    }
+                    android.view.KeyEvent.KEYCODE_DPAD_RIGHT, // THINKLETの右ボタン
+                    android.view.KeyEvent.KEYCODE_VOLUME_DOWN -> { // フォールバック
+                        android.util.Log.d(TAG, "No button (right) pressed")
+                        pendingAnalyzeResult?.let {
+                            confirmationMode = ConfirmationMode.NONE
+                            handleUserConfirmation(false, it)
+                            pendingAnalyzeResult = null
+                        }
+                        return true
+                    }
+                }
+            }
+            ConfirmationMode.CORRECTION -> {
+                when (keyCode) {
+                    android.view.KeyEvent.KEYCODE_DPAD_LEFT,
+                    android.view.KeyEvent.KEYCODE_VOLUME_UP -> {
+                        android.util.Log.d(TAG, "Yes button (left) pressed for correction")
+                        val correctionText = pendingCorrectionText
+                        val result = pendingAnalyzeResult
+                        if (correctionText != null && result != null) {
+                            confirmationMode = ConfirmationMode.NONE
+                            handleCorrectionConfirmation(true, correctionText, result)
+                            pendingCorrectionText = null
+                            pendingAnalyzeResult = null
+                        }
+                        return true
+                    }
+                    android.view.KeyEvent.KEYCODE_DPAD_RIGHT,
+                    android.view.KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                        android.util.Log.d(TAG, "No button (right) pressed for correction")
+                        val result = pendingAnalyzeResult
+                        if (result != null) {
+                            confirmationMode = ConfirmationMode.NONE
+                            handleCorrectionConfirmation(false, "", result)
+                            pendingCorrectionText = null
+                            pendingAnalyzeResult = null
+                        }
+                        return true
+                    }
+                }
+            }
+            ConfirmationMode.NONE -> {
+                // Not in confirmation mode, let default handling occur
+            }
+        }
+
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: android.view.KeyEvent?): Boolean {
+        android.util.Log.d(TAG, "onKeyUp: keyCode=$keyCode, confirmationMode=$confirmationMode")
+
+        // Center button release for photo/suggest
+        if (keyCode == android.view.KeyEvent.KEYCODE_CAMERA || // THINKLET center button
+            keyCode == android.view.KeyEvent.KEYCODE_DPAD_CENTER ||
+            keyCode == android.view.KeyEvent.KEYCODE_ENTER) {
+            if (confirmationMode == ConfirmationMode.NONE && centerButtonDownTime > 0) {
+                val pressDuration = System.currentTimeMillis() - centerButtonDownTime
+                android.util.Log.d(TAG, "Center button released after ${pressDuration}ms")
+
+                centerButtonDownTime = 0
+
+                if (pressDuration >= LONG_PRESS_THRESHOLD) {
+                    // Long press - suggest meal
+                    android.util.Log.d(TAG, "Long press detected - suggesting meal")
+                    suggestMeal()
+                } else {
+                    // Short press - take photo and analyze
+                    android.util.Log.d(TAG, "Short press detected - taking photo")
+                    takePhotoAndAnalyze()
+                }
+                return true
+            }
+        }
+
+        return super.onKeyUp(keyCode, event)
     }
 
     override fun onDestroy() {

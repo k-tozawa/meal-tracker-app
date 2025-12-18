@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.meallogger"
         minSdk = 27
         targetSdk = 34
-        versionCode = 55
-        versionName = "4.2.0"
+        versionCode = 62
+        versionName = "4.2.7"
 
         // API Base URL configuration (now using UserPreferences for all URLs)
         buildConfigField("String", "API_BASE_URL", "\"http://192.168.3.8:8000\"")
