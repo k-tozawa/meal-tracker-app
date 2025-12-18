@@ -205,6 +205,17 @@ class VoiceService(private val context: Context) {
         }
     }
 
+    fun stopTts() {
+        Log.d(TAG, "Stopping TTS playback")
+        mediaPlayer?.let {
+            if (it.isPlaying) {
+                it.stop()
+            }
+            it.release()
+        }
+        mediaPlayer = null
+    }
+
     fun setGlobalCommandListener(listener: (String) -> Unit) {
         globalCommandListener = listener
     }

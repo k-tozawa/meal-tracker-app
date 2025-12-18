@@ -74,7 +74,7 @@ class VoskVoiceService(private val context: Context) {
 
             when (aSpeechState) {
                 TLXFEData.SpeechState.SpeechStart -> {
-                    Log.d(TAG, "Speech detected - starting Vosk recognition")
+                    Log.d(TAG, "Speech detected - Starting Vosk recognition")
                     isSpeechActive = true
 
                     // Vosk認識器をリセット
@@ -166,7 +166,13 @@ class VoskVoiceService(private val context: Context) {
                 }
 
                 TLXFEData.SpeechState.SpeechEnd -> {
-                    Log.d(TAG, "Speech ended - getting final Vosk result")
+                    Log.d(TAG, "Speech ended - isSpeechActive=$isSpeechActive")
+
+                    if (!isSpeechActive) {
+                        Log.d(TAG, "Ignoring SpeechEnd (was not processing)")
+                        return
+                    }
+
                     isSpeechActive = false
 
                     // デバッグ用：最後のバッファを保存してファイルを閉じる
@@ -222,7 +228,7 @@ class VoskVoiceService(private val context: Context) {
         }
     }
 
-    // アプリ起動時にバックグラウンドで全て初期化
+    // アプリ起動時にバックグラウンドでXFEとVoskを初期化
     fun initializeModel(onComplete: ((Boolean) -> Unit)? = null) {
         CoroutineScope(Dispatchers.IO).launch {
             val voskLoaded = loadVoskModel()
@@ -234,32 +240,20 @@ class VoskVoiceService(private val context: Context) {
             // AudioManager設定
             setupAudioManager()
 
-            // XFE初期化
+            // XFE初期化（setup()のみ、1回だけ）
             val xfeReady = setupXfe()
             if (!xfeReady) {
                 mainHandler.post { onComplete?.invoke(false) }
                 return@launch
             }
 
-            // AudioRecord作成（まだ録音開始しない）
-            val audioReady = createAudioRecorder()
-            if (!audioReady) {
-                mainHandler.post { onComplete?.invoke(false) }
-                return@launch
-            }
-
             isInitialized.set(true)
-            Log.d(TAG, "All components initialized successfully")
+            Log.d(TAG, "XFE and Vosk initialized successfully")
             mainHandler.post { onComplete?.invoke(true) }
         }
     }
 
     fun startListening(onResult: (String) -> Unit, onError: ((String) -> Unit)? = null) {
-        if (isRecording.get()) {
-            Log.w(TAG, "Already recording")
-            return
-        }
-
         // 初期化済みかチェック
         if (!isInitialized.get()) {
             Log.e(TAG, "Not initialized. Call initializeModel() first.")
@@ -267,21 +261,28 @@ class VoskVoiceService(private val context: Context) {
             return
         }
 
+        if (isRecording.get()) {
+            Log.w(TAG, "Already recording")
+            return
+        }
+
         this.onResultCallback = onResult
         this.onErrorCallback = onError
 
-        // XFE処理を開始（setupXfeで既にコールバック登録済み）
-        val ret = xfe?.startProcessing()
-        Log.d(TAG, "XFE startProcessing() returned: $ret")
-        if (ret == null || ret < 0) {
-            Log.e(TAG, "Failed to start XFE processing: $ret")
-            mainHandler.post { onError?.invoke("XFE処理の開始に失敗しました") }
-            return
-        }
-        Log.d(TAG, "XFE processing started successfully")
+        // XFE startProcessing → AudioRecord作成 → 録音開始
+        CoroutineScope(Dispatchers.IO).launch {
+            // XFE処理を開始（setupは起動時に1回だけ済んでいる）
+            val ret = xfe?.startProcessing()
+            if (ret == null || ret < 0) {
+                Log.e(TAG, "Failed to start XFE processing: $ret")
+                mainHandler.post { onError?.invoke("XFE処理の開始に失敗しました") }
+                return@launch
+            }
+            Log.d(TAG, "XFE processing started")
 
-        // 録音開始
-        startRecording()
+            // AudioRecordを作成して録音開始
+            startRecording()
+        }
     }
 
     private fun setupAudioManager() {
@@ -363,7 +364,7 @@ class VoskVoiceService(private val context: Context) {
     private fun setupXfe(): Boolean {
         Log.d(TAG, "Setting up XFE")
 
-        // 既にXFEが存在する場合はスキップ
+        // 既にセットアップ済みならスキップ
         if (xfe != null) {
             Log.d(TAG, "XFE already set up")
             return true
@@ -376,7 +377,7 @@ class VoskVoiceService(private val context: Context) {
             return false
         }
 
-        // XFE初期化（HumanVoiceモード）
+        // XFE初期化（HumanVoiceモード）- 1回だけ
         xfe = TLXFEPreprocessor(TLXFEPreprocessor.ProcessMode.HumanVoice)
         xfe?.registerLicenseData(licenseData)
         xfe?.registerVadCallback(vadCallback, null)
@@ -418,35 +419,6 @@ class VoskVoiceService(private val context: Context) {
         return true
     }
 
-    private fun createAudioRecorder(): Boolean {
-        try {
-            val sampleRate = 48000
-            audioRecordBufferSize = AudioRecord.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_OUT_5POINT1,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-
-            audioRecorder = AudioRecord.Builder()
-                .setAudioSource(MediaRecorder.AudioSource.MIC)
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_5POINT1)
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .build()
-                )
-                .setBufferSizeInBytes(audioRecordBufferSize)
-                .build()
-
-            Log.d(TAG, "AudioRecord created successfully (buffer: $audioRecordBufferSize bytes)")
-            return true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to create AudioRecord", e)
-            return false
-        }
-    }
-
     private fun getLicenseData(): String {
         // 複数のライセンスファイルパスを試す
         val licensePaths = arrayOf(
@@ -483,13 +455,27 @@ class VoskVoiceService(private val context: Context) {
 
     @android.annotation.SuppressLint("MissingPermission")
     private fun startRecording() {
-        if (audioRecorder == null) {
-            Log.e(TAG, "AudioRecord not created")
-            mainHandler.post { onErrorCallback?.invoke("AudioRecordが初期化されていません") }
-            return
-        }
-
         try {
+            // AudioRecordを作成
+            val sampleRate = 48000
+            audioRecordBufferSize = AudioRecord.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_OUT_5POINT1,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+
+            audioRecorder = AudioRecord.Builder()
+                .setAudioSource(MediaRecorder.AudioSource.MIC)
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_5POINT1)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .build()
+                )
+                .setBufferSizeInBytes(audioRecordBufferSize)
+                .build()
+
             audioRecorder?.startRecording()
             isRecording.set(true)
             isSpeechActive = false
@@ -544,48 +530,40 @@ class VoskVoiceService(private val context: Context) {
     }
 
     fun stopRecording() {
-        if (!isRecording.get()) return
+        Log.d(TAG, "Stopping recording and XFE processing")
 
-        Log.d(TAG, "Stopping recording")
+        // 録音を停止
         isRecording.set(false)
         isSpeechActive = false
 
+        // 録音ジョブの終了を待つ
+        recordingJob?.cancel()
+        recordingJob = null
+
+        // AudioRecordを停止・解放
         try {
-            // 録音ループを停止
-            recordingJob?.cancel()
-            recordingJob = null
-
-            // XFE処理停止
-            xfe?.stopProcessing()
-
-            // 録音停止（releaseしない）
             audioRecorder?.stop()
-
-            // デバッグ用ファイルを閉じる
-            if (enableDebugRecording && debugOutputStream != null) {
-                try {
-                    debugOutputStream?.close()
-                    Log.d(TAG, "Debug file closed on stop")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error closing debug file", e)
-                } finally {
-                    debugOutputStream = null
-                }
-            }
-
-            // XFEを完全リセット（サンプルコードのパターン）
-            Log.d(TAG, "Cleaning up XFE for reset")
-            xfe?.cleanup()
-            xfe = null
-
-            // 次回のstartListening用に再セットアップ
-            if (!setupXfe()) {
-                Log.e(TAG, "Failed to re-setup XFE after recording stop")
-            } else {
-                Log.d(TAG, "XFE re-setup successful")
-            }
+            audioRecorder?.release()
+            audioRecorder = null
+            Log.d(TAG, "AudioRecord stopped and released")
         } catch (e: Exception) {
-            Log.e(TAG, "Error stopping recording", e)
+            Log.e(TAG, "Error stopping AudioRecord", e)
+        }
+
+        // XFE処理を停止（cleanup()はshutdown時のみ）
+        val ret = xfe?.stopProcessing()
+        Log.d(TAG, "XFE processing stopped: $ret")
+
+        // デバッグ用ファイルを閉じる
+        if (enableDebugRecording && debugOutputStream != null) {
+            try {
+                debugOutputStream?.close()
+                Log.d(TAG, "Debug file closed")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error closing debug file", e)
+            } finally {
+                debugOutputStream = null
+            }
         }
     }
 

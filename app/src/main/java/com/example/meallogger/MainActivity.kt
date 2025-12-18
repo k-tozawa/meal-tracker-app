@@ -40,9 +40,11 @@ class MainActivity : AppCompatActivity() {
     private enum class ConfirmationMode { NONE, ANALYZE_RESULT, CORRECTION }
     private var confirmationMode = ConfirmationMode.NONE
 
-    // Center button long press detection
+    // Button long press detection
     private var centerButtonDownTime: Long = 0
-    private val LONG_PRESS_THRESHOLD = 500L // 500ms
+    private var leftButtonDownTime: Long = 0
+    private var rightButtonDownTime: Long = 0
+    private val LONG_PRESS_THRESHOLD = 1500L // 1500ms (1.5秒長押しで献立提案)
 
     private val requiredPermissions = arrayOf(
         Manifest.permission.CAMERA,
@@ -129,64 +131,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun suggestMeal() {
-        // 時間帯から meal_type を判定
-        val autoDetectedMealType = getCurrentMealType()
-        val mealTypeName = getMealTypeName(autoDetectedMealType)
-
-        // まず食事の種類を確認
-        voiceService.speakAndThen("${mealTypeName}の献立ですね。変更される場合は食事の種類を、このままで良ければ「はい」とお答えください。") {
-            android.util.Log.d("MainActivity", "Starting WebSocket voice recognition for meal type confirmation")
-            voskVoiceService.startListening(
-                onResult = { confirmText ->
-                    android.util.Log.d("MainActivity", "Meal type confirmation: $confirmText")
-
-                    // ユーザーの応答から meal_type を決定
-                    val finalMealType = when {
-                        confirmText.contains("朝食") || confirmText.contains("朝ごはん") -> "breakfast"
-                        confirmText.contains("昼食") || confirmText.contains("昼ごはん") || confirmText.contains("ランチ") -> "lunch"
-                        confirmText.contains("夕食") || confirmText.contains("夜ごはん") || confirmText.contains("晩ごはん") || confirmText.contains("ディナー") -> "dinner"
-                        confirmText.contains("おやつ") || confirmText.contains("間食") || confirmText.contains("スナック") -> "snack"
-                        confirmText.contains("はい") || confirmText.contains("そのまま") || confirmText.contains("お願い") -> autoDetectedMealType
-                        else -> autoDetectedMealType // デフォルトは自動判定のまま
-                    }
-
-                    // 次に preferences を聞く
-                    askForPreferences(finalMealType)
-                },
-                onError = { error ->
-                    android.util.Log.e("MainActivity", "WebSocket voice recognition error: $error")
-                    speak("音声認識でエラーが発生しました")
-                    binding.statusText.text = ""
-                }
-            )
-        }
-    }
-
-    private fun askForPreferences(mealType: String) {
-        voiceService.speakAndThen("何かご希望はありますか？特になければ「お任せ」とお答えください。") {
-            android.util.Log.d("MainActivity", "Starting WebSocket voice recognition for preferences")
-            voskVoiceService.startListening(
-                onResult = { preferencesText ->
-                    android.util.Log.d("MainActivity", "Preferences: $preferencesText")
-
-                    // 「お任せ」「特になし」などの場合は preferences を null にする
-                    val preferences = if (preferencesText.contains("お任せ") ||
-                                         preferencesText.contains("特になし") ||
-                                         preferencesText.contains("ない")) {
-                        null
-                    } else {
-                        preferencesText
-                    }
-
-                    // 献立を提案
-                    fetchMealSuggestion(mealType, preferences)
-                },
-                onError = { error ->
-                    android.util.Log.e("MainActivity", "WebSocket voice recognition error: $error")
-                    speak("音声認識でエラーが発生しました")
-                    binding.statusText.text = ""
-                }
-            )
+        // ボタンを押したらすぐにフィードバック（音を確実に出してから次へ）
+        voiceService.speakAndThen("献立を提案します。少々お待ちください。") {
+            // 時間帯から meal_type を自動判定して即座に献立提案
+            val autoDetectedMealType = getCurrentMealType()
+            fetchMealSuggestion(autoDetectedMealType, null)
         }
     }
 
@@ -214,18 +163,35 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun fetchMealSuggestion(mealType: String, preferences: String?) {
-        speak("献立を提案します")
         binding.statusText.text = "献立提案中..."
 
         lifecycleScope.launch {
+            var madaCount = 1
+            var isCompleted = false
+
+            // 結果を待ちながら定期的に「まだ考えています」を言う（3秒ごと）
+            val waitingJob = launch {
+                kotlinx.coroutines.delay(3000) // 3秒待つ
+                while (!isCompleted) {
+                    val madaText = "まだ".repeat(madaCount) + "考えています。"
+                    speak(madaText)
+                    madaCount++
+                    kotlinx.coroutines.delay(3000) // 3秒ごと
+                }
+            }
+
             try {
                 val suggestion = mealAnalysisService.suggestMeal(userId, mealType, preferences)
+                isCompleted = true
+                waitingJob.cancel()
+
                 if (suggestion != null) {
                     // 料理名をリスト化
                     val dishNames = suggestion.dishes.joinToString("、") { it.name }
 
                     // 発話内容を構築
                     val message = buildString {
+                        append("おまたせしました。献立が決まりました。")
                         append("おすすめの献立は、${suggestion.meal_name}です。")
                         append("具体的には、${dishNames}です。")
                         append(suggestion.reason)
@@ -238,6 +204,8 @@ class MainActivity : AppCompatActivity() {
                     binding.statusText.text = ""
                 }
             } catch (e: Exception) {
+                isCompleted = true
+                waitingJob.cancel()
                 android.util.Log.e("MainActivity", "Meal suggestion error", e)
                 speak("エラーが発生しました")
                 binding.statusText.text = ""
@@ -275,10 +243,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun initializeVoiceServices() {
         android.util.Log.d("MainActivity", "initializeVoiceServices called")
+
+        // TTS音量をデフォルト100%に設定
+        userPreferences.setVoiceVolume(1.0f)
+        android.util.Log.d("MainActivity", "TTS volume set to 100%")
+
         voiceService.initialize { status ->
             android.util.Log.d("MainActivity", "VoiceService init status: $status")
             if (status == 0) {
-                speak("食事記録アプリを起動しました。写真を撮るボタンを押してください。")
+                speak("アプリを起動しました")
             } else {
                 speak("音声サービスの初期化に失敗しました")
             }
@@ -379,18 +352,23 @@ class MainActivity : AppCompatActivity() {
         voskVoiceService.stopRecording()
 
         voiceService.speakAndThen("修正内容をどうぞ") {
-            android.util.Log.d("MainActivity", "Starting WebSocket voice recognition for correction")
-            voskVoiceService.startListening(
-                onResult = { correctionText ->
-                    android.util.Log.d("MainActivity", "Correction text: $correctionText")
-                    confirmCorrection(correctionText, analyzeResult)
-                },
-                onError = { error ->
-                    android.util.Log.e("MainActivity", "WebSocket voice recognition error: $error")
-                    speak("音声認識でエラーが発生しました")
-                    binding.statusText.text = ""
-                }
-            )
+            // Wait 1 second after TTS for XFE setup to complete
+            android.util.Log.d("MainActivity", "Waiting 1 second before starting voice recognition")
+            lifecycleScope.launch {
+                kotlinx.coroutines.delay(1000)
+                android.util.Log.d("MainActivity", "Starting voice recognition for correction")
+                voskVoiceService.startListening(
+                    onResult = { correctionText ->
+                        android.util.Log.d("MainActivity", "Correction text: $correctionText")
+                        confirmCorrection(correctionText, analyzeResult)
+                    },
+                    onError = { error ->
+                        android.util.Log.e("MainActivity", "Voice recognition error: $error")
+                        speak("音声認識でエラーが発生しました")
+                        binding.statusText.text = ""
+                    }
+                )
+            }
         }
     }
 
@@ -535,11 +513,43 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Left button press - detect long press for meal suggestion when NOT in confirmation mode
+        // keyCode=24 is VOLUME_UP (THINKLET left button)
+        if (keyCode == 24 || keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP ||
+            keyCode == 113 || keyCode == android.view.KeyEvent.KEYCODE_DPAD_LEFT) {
+            if (confirmationMode == ConfirmationMode.NONE) {
+                if (leftButtonDownTime == 0L) {
+                    // 最初のonKeyDownの時だけ記録（キーリピートを無視）
+                    leftButtonDownTime = System.currentTimeMillis()
+                    android.util.Log.d(TAG, "Left button FIRST down at $leftButtonDownTime (long press for meal suggestion)")
+                }
+                // キーリピートも含めて全てのonKeyDownを消費（音量変更を防ぐ）
+                return true
+            }
+        }
+
+        // Right button press - detect long press for meal suggestion when NOT in confirmation mode
+        // keyCode=25 is VOLUME_DOWN (THINKLET right button)
+        if (keyCode == 25 || keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN ||
+            keyCode == 31 || keyCode == android.view.KeyEvent.KEYCODE_DPAD_RIGHT) {
+            if (confirmationMode == ConfirmationMode.NONE) {
+                if (rightButtonDownTime == 0L) {
+                    // 最初のonKeyDownの時だけ記録（キーリピートを無視）
+                    rightButtonDownTime = System.currentTimeMillis()
+                    android.util.Log.d(TAG, "Right button FIRST down at $rightButtonDownTime (long press for meal suggestion)")
+                }
+                // キーリピートも含めて全てのonKeyDownを消費（音量変更を防ぐ）
+                return true
+            }
+        }
+
         when (confirmationMode) {
             ConfirmationMode.ANALYZE_RESULT -> {
                 when (keyCode) {
-                    android.view.KeyEvent.KEYCODE_DPAD_LEFT, // THINKLETの左ボタン
-                    android.view.KeyEvent.KEYCODE_VOLUME_UP -> { // フォールバック
+                    24, // THINKLET left button (VOLUME_UP)
+                    113, // CTRL_LEFT
+                    android.view.KeyEvent.KEYCODE_DPAD_LEFT,
+                    android.view.KeyEvent.KEYCODE_VOLUME_UP -> {
                         android.util.Log.d(TAG, "Yes button (left) pressed")
                         pendingAnalyzeResult?.let {
                             confirmationMode = ConfirmationMode.NONE
@@ -548,8 +558,10 @@ class MainActivity : AppCompatActivity() {
                         }
                         return true
                     }
-                    android.view.KeyEvent.KEYCODE_DPAD_RIGHT, // THINKLETの右ボタン
-                    android.view.KeyEvent.KEYCODE_VOLUME_DOWN -> { // フォールバック
+                    25, // THINKLET right button (VOLUME_DOWN)
+                    31, // right button alternative
+                    android.view.KeyEvent.KEYCODE_DPAD_RIGHT,
+                    android.view.KeyEvent.KEYCODE_VOLUME_DOWN -> {
                         android.util.Log.d(TAG, "No button (right) pressed")
                         pendingAnalyzeResult?.let {
                             confirmationMode = ConfirmationMode.NONE
@@ -562,6 +574,8 @@ class MainActivity : AppCompatActivity() {
             }
             ConfirmationMode.CORRECTION -> {
                 when (keyCode) {
+                    24, // THINKLET left button (VOLUME_UP)
+                    113, // CTRL_LEFT
                     android.view.KeyEvent.KEYCODE_DPAD_LEFT,
                     android.view.KeyEvent.KEYCODE_VOLUME_UP -> {
                         android.util.Log.d(TAG, "Yes button (left) pressed for correction")
@@ -575,6 +589,8 @@ class MainActivity : AppCompatActivity() {
                         }
                         return true
                     }
+                    25, // THINKLET right button (VOLUME_DOWN)
+                    31, // right button alternative
                     android.view.KeyEvent.KEYCODE_DPAD_RIGHT,
                     android.view.KeyEvent.KEYCODE_VOLUME_DOWN -> {
                         android.util.Log.d(TAG, "No button (right) pressed for correction")
@@ -611,8 +627,9 @@ class MainActivity : AppCompatActivity() {
                 centerButtonDownTime = 0
 
                 if (pressDuration >= LONG_PRESS_THRESHOLD) {
-                    // Long press - suggest meal
-                    android.util.Log.d(TAG, "Long press detected - suggesting meal")
+                    // Long press - stop TTS if playing, then suggest meal
+                    android.util.Log.d(TAG, "Long press detected - stopping TTS and suggesting meal")
+                    voiceService.stopTts()
                     suggestMeal()
                 } else {
                     // Short press - take photo and analyze
@@ -620,6 +637,48 @@ class MainActivity : AppCompatActivity() {
                     takePhotoAndAnalyze()
                 }
                 return true
+            }
+        }
+
+        // Left button release - long press for meal suggestion
+        // keyCode=24 is VOLUME_UP (THINKLET left button)
+        if (keyCode == 24 || keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP ||
+            keyCode == 113 || keyCode == android.view.KeyEvent.KEYCODE_DPAD_LEFT) {
+            if (confirmationMode == ConfirmationMode.NONE && leftButtonDownTime > 0) {
+                val pressDuration = System.currentTimeMillis() - leftButtonDownTime
+                android.util.Log.d(TAG, "Left button released after ${pressDuration}ms")
+
+                leftButtonDownTime = 0
+
+                if (pressDuration >= LONG_PRESS_THRESHOLD) {
+                    // Long press - stop TTS if playing, then suggest meal
+                    android.util.Log.d(TAG, "Left button long press detected - stopping TTS and suggesting meal")
+                    voiceService.stopTts()
+                    suggestMeal()
+                    return true
+                }
+                // Short press - do nothing (only used for Yes/No confirmation)
+            }
+        }
+
+        // Right button release - long press for meal suggestion
+        // keyCode=25 is VOLUME_DOWN (THINKLET right button)
+        if (keyCode == 25 || keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN ||
+            keyCode == 31 || keyCode == android.view.KeyEvent.KEYCODE_DPAD_RIGHT) {
+            if (confirmationMode == ConfirmationMode.NONE && rightButtonDownTime > 0) {
+                val pressDuration = System.currentTimeMillis() - rightButtonDownTime
+                android.util.Log.d(TAG, "Right button released after ${pressDuration}ms")
+
+                rightButtonDownTime = 0
+
+                if (pressDuration >= LONG_PRESS_THRESHOLD) {
+                    // Long press - stop TTS if playing, then suggest meal
+                    android.util.Log.d(TAG, "Right button long press detected - stopping TTS and suggesting meal")
+                    voiceService.stopTts()
+                    suggestMeal()
+                    return true
+                }
+                // Short press - do nothing (only used for Yes/No confirmation)
             }
         }
 
