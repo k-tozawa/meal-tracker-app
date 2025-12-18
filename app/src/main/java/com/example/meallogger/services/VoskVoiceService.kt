@@ -1,5 +1,6 @@
 package com.example.meallogger.services
 
+import com.example.meallogger.utils.EmptyAudioPlayer
 import ai.fd.thinklet.xfe.TLXFECallback
 import ai.fd.thinklet.xfe.TLXFEConfigs
 import ai.fd.thinklet.xfe.TLXFEData
@@ -35,6 +36,7 @@ class VoskVoiceService(private val context: Context) {
     private var isSpeechActive = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private var recordingJob: Job? = null
+    private val emptyAudioPlayer = EmptyAudioPlayer()
 
     private var onResultCallback: ((String) -> Unit)? = null
     private var onErrorCallback: ((String) -> Unit)? = null
@@ -480,6 +482,10 @@ class VoskVoiceService(private val context: Context) {
             isRecording.set(true)
             isSpeechActive = false
 
+            // エコーキャンセル用に無音を再生開始
+            emptyAudioPlayer.start()
+            Log.d(TAG, "Started EmptyAudioPlayer for echo cancellation")
+
             Log.d(TAG, "Started THINKLET 6-channel 48kHz recording with XFE VAD + Vosk")
 
             // 録音ループを別スレッドで開始
@@ -550,6 +556,10 @@ class VoskVoiceService(private val context: Context) {
             Log.e(TAG, "Error stopping AudioRecord", e)
         }
 
+        // エコーキャンセル用の無音再生を停止
+        emptyAudioPlayer.stop()
+        Log.d(TAG, "Stopped EmptyAudioPlayer")
+
         // XFE処理を停止（cleanup()はshutdown時のみ）
         val ret = xfe?.stopProcessing()
         Log.d(TAG, "XFE processing stopped: $ret")
@@ -569,6 +579,9 @@ class VoskVoiceService(private val context: Context) {
 
     fun shutdown() {
         stopRecording()
+
+        // エコーキャンセル用の無音再生を停止（念のため）
+        emptyAudioPlayer.stop()
 
         // AudioRecord解放
         try {
