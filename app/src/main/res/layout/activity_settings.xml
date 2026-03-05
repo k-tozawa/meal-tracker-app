@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="設定"
+            android:textSize="24sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="24dp" />
+
+        <!-- カメラ回転設定 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="カメラの回転"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="デバイスの持ち方に合わせて回転を設定してください"
+            android:textSize="14sp"
+            android:layout_marginBottom="8dp" />
+
+        <RadioGroup
+            android:id="@+id/rotationRadioGroup"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="24dp">
+
+            <RadioButton
+                android:id="@+id/rotation0"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="0度（回転なし）" />
+
+            <RadioButton
+                android:id="@+id/rotation90"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="90度" />
+
+            <RadioButton
+                android:id="@+id/rotation180"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="180度" />
+
+            <RadioButton
+                android:id="@+id/rotation270"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="270度"
+                android:checked="true" />
+        </RadioGroup>
+
+        <!-- デバッグ録音設定 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="デバッグ録音"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp" />
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/debugRecordingSwitch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="音声認識のデバッグ録音を有効にする"
+            android:layout_marginBottom="24dp" />
+
+        <!-- 音声音量設定 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="音声音量"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:id="@+id/volumeValueText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="30%"
+            android:textSize="14sp"
+            android:layout_marginBottom="8dp" />
+
+        <SeekBar
+            android:id="@+id/volumeSeekBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="100"
+            android:progress="30"
+            android:layout_marginBottom="24dp" />
+
+        <!-- サーバーURL設定 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="サーバーURL"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="例: http://192.168.3.8:8000"
+            android:textSize="14sp"
+            android:layout_marginBottom="8dp" />
+
+        <EditText
+            android:id="@+id/serverUrlEditText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="http://192.168.3.8:8000"
+            android:inputType="textUri"
+            android:layout_marginBottom="24dp" />
+
+        <Button
+            android:id="@+id/saveButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="保存" />
+
+    </LinearLayout>
+</ScrollView>

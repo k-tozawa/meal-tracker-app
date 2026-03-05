@@ -1,0 +1,17 @@
+{
+  "key-config": [
+    {
+      "key-name": "center",
+      "key-event": "single-released",
+      "key-action": {
+        "action-type": "launch-app",
+        "action-param": {
+          "package-name": "ai.fd.thinklet.app.outing.advisor",
+          "class-name": "ai.fd.thinklet.app.outing.advisor.MainActivity",
+          "action-name": "android.intent.action.MAIN",
+          "flags": ["FLAG_ACTIVITY_NEW_TASK", "FLAG_ACTIVITY_RESET_TASK_IF_NEEDED"]
+        }
+      }
+    }
+  ]
+}
