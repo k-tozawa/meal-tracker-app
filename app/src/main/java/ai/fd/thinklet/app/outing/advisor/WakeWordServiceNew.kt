@@ -232,9 +232,17 @@ class WakeWordServiceNew : Service() {
             return
         }
 
-        audioRecorder?.startRecording()
-        isAudioRecordRunning.set(true)
         emptyAudioPlayer.start()
+        audioRecorder?.startRecording()
+
+        val recordingState = audioRecorder?.recordingState
+        if (recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            Log.e(TAG, "[ERROR] AudioRecord failed to start, state=$recordingState")
+            emptyAudioPlayer.stop()
+            return
+        }
+
+        isAudioRecordRunning.set(true)
         Log.d(TAG, "[AUDIO] Recording Started")
 
         recordingJob = serviceScope.launch(Dispatchers.IO) {
